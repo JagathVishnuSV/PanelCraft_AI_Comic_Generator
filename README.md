@@ -1,10 +1,6 @@
-![PanelCraft Logo](public/logo.png)
-
 # PanelCraft: AI Comic Generator
 
 Transform your stories into visually engaging comic strips using AI technology. PanelCraft automatically analyzes your narrative, breaks it down into panels, and generates custom illustrations to bring your stories to life.
-
-[Watch Demo Video](https://youtu.be/TaEqlmV5eg8)
 
 ## Features
 
