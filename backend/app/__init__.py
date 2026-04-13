@@ -1,0 +1,3 @@
+"""
+StoryStrip backend application package.
+""" 
