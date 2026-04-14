@@ -8,7 +8,7 @@ import uuid
 import hashlib
 from urllib.parse import quote_plus
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from dotenv import load_dotenv
 import requests
@@ -35,9 +35,13 @@ AIHORDE_POLL_SECONDS = float(os.getenv("AIHORDE_POLL_SECONDS", "2.5"))
 AIHORDE_TIMEOUT_SECONDS = int(os.getenv("AIHORDE_TIMEOUT_SECONDS", "90"))
 AIHORDE_IMAGE_WIDTH = int(os.getenv("AIHORDE_IMAGE_WIDTH", "768"))
 AIHORDE_IMAGE_HEIGHT = int(os.getenv("AIHORDE_IMAGE_HEIGHT", "1152"))
-AIHORDE_STEPS = int(os.getenv("AIHORDE_STEPS", "30"))
+AIHORDE_STEPS = int(os.getenv("AIHORDE_STEPS", "24"))
 AIHORDE_CFG_SCALE = float(os.getenv("AIHORDE_CFG_SCALE", "7.5"))
 AIHORDE_SAMPLER_NAME = os.getenv("AIHORDE_SAMPLER_NAME", "k_euler_a")
+AIHORDE_POST_PROCESSORS = [m.strip() for m in os.getenv(
+    "AIHORDE_POST_PROCESSORS",
+    "4x_AnimeSharp"
+).split(",") if m.strip()]
 AIHORDE_NEGATIVE_PROMPT = os.getenv(
     "AIHORDE_NEGATIVE_PROMPT",
     "nsfw, nude, nudity, explicit, sexual content, fetish, porn, gore, graphic violence, blood, "
@@ -53,12 +57,20 @@ GEMINI_TEXT_MODEL_CANDIDATES = [m.strip() for m in os.getenv(
 ).split(",") if m.strip()]
 GEMINI_IMAGE_MODEL_CANDIDATES = [m.strip() for m in os.getenv(
     "GEMINI_IMAGE_MODELS",
-    "gemini-3.1-flash-image-preview,gemini-2.5-flash-image"
+    "gemini-3.1-flash-image-preview,gemini-3-pro-image-preview,gemini-2.5-flash-image"
 ).split(",") if m.strip()]
+GEMINI_IMAGE_ENABLED = os.getenv("GEMINI_IMAGE_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
 GROQ_IMAGE_MODEL_CANDIDATES = [m.strip() for m in os.getenv(
     "GROQ_IMAGE_MODELS",
     ""
 ).split(",") if m.strip()]
+TARGET_IMAGE_WIDTH = int(os.getenv("TARGET_IMAGE_WIDTH", "1024"))
+TARGET_IMAGE_HEIGHT = int(os.getenv("TARGET_IMAGE_HEIGHT", "1536"))
+
+# Some AI Horde API keys reject filtered model requests. Disable model filters
+# after the first 403 to avoid repeated noisy retries for every panel.
+AIHORDE_MODEL_FILTER_ENABLED = True
+AIHORDE_PROVIDER_ENABLED = True
 
 if not groq_api_key:
     raise ValueError(f"GROQ_API_KEY not found in environment variables. Looked in: {env_path}")
@@ -74,6 +86,8 @@ text_client = OpenAI(
 genai_client = None
 if gemini_api_key:
     genai_client = genai.Client(api_key=gemini_api_key)
+
+GEMINI_IMAGE_PROVIDER_ENABLED = bool(genai_client) and GEMINI_IMAGE_ENABLED
 
 # Create images directory if it doesn't exist
 IMAGES_DIR = Path(__file__).parent.parent.parent / 'static' / 'images'
@@ -271,13 +285,14 @@ Step 6 - Output hook.
                 print("INFO: Retrying image generation with stricter SFW prompt variant.")
 
             # Quality-first provider: Gemini native image generation
-            try:
-                gemini_image = StoryService._generate_with_gemini_image(prompt_variant)
-                if gemini_image is not None:
-                    return StoryService.save_generated_image(gemini_image, filename=cache_filename)
-            except Exception as e:
-                last_error = e
-                print(f"Gemini image generation failed: {str(e) or repr(e)}")
+            if GEMINI_IMAGE_PROVIDER_ENABLED:
+                try:
+                    gemini_image = StoryService._generate_with_gemini_image(prompt_variant)
+                    if gemini_image is not None:
+                        return StoryService.save_generated_image(gemini_image, filename=cache_filename)
+                except Exception as e:
+                    last_error = e
+                    print(f"Gemini image generation failed: {str(e) or repr(e)}")
 
             # Free provider: AI Horde community SD/SDXL workers
             try:
@@ -339,7 +354,8 @@ Step 6 - Output hook.
         return (
             "Single comic panel illustration, professional line art, clean ink, rich cel-shading, "
             "dynamic cinematic framing, consistent character design, detailed background, high contrast color palette, "
-            "crisp focus, no blurry output, no text, no speech bubbles, no watermark. "
+            "crisp focus, ultra-detailed, safe-for-work, fully clothed characters, "
+            "no blurry output, no text, no speech bubbles, no watermark. "
             f"Scene: {cleaned_desc}"
         )
 
@@ -351,7 +367,16 @@ Step 6 - Output hook.
             StoryService._sanitize_prompt_for_sfw(prompt) +
             " Keep everything strictly safe-for-work, fully clothed, non-sexual, and non-graphic."
         )
-        return [first] if strict == first else [first, strict]
+        pg13 = (
+            StoryService._sanitize_prompt_for_sfw(prompt) +
+            " Keep this PG-13 comic style with no erotic cues and no graphic violence."
+        )
+
+        variants = [first]
+        for candidate in (strict, pg13):
+            if candidate not in variants:
+                variants.append(candidate)
+        return variants
 
     @staticmethod
     def _sanitize_prompt_for_sfw(prompt: str) -> str:
@@ -370,52 +395,102 @@ Step 6 - Output hook.
     @staticmethod
     def _generate_with_gemini_image(prompt: str):
         """Generate an image with Gemini native image models when API key is available."""
+        global GEMINI_IMAGE_PROVIDER_ENABLED
+
+        if not GEMINI_IMAGE_PROVIDER_ENABLED:
+            raise RuntimeError("Gemini image provider disabled")
+
         if not genai_client:
             raise RuntimeError("Gemini image client unavailable")
 
         last_error = None
         for model_id in GEMINI_IMAGE_MODEL_CANDIDATES:
-            for attempt in range(2):
-                try:
-                    config = types.GenerateContentConfig(
-                        response_modalities=["IMAGE"],
-                        image_config=types.ImageConfig(aspect_ratio="3:4", image_size="2K"),
-                    )
-                    if "2.5-flash-image" in model_id:
-                        config = types.GenerateContentConfig(
-                            response_modalities=["IMAGE"],
-                            image_config=types.ImageConfig(aspect_ratio="3:4"),
+            config_candidates = StoryService._build_gemini_image_config_candidates(model_id)
+
+            for config_idx, config in enumerate(config_candidates, start=1):
+                for attempt in range(2):
+                    try:
+                        response = StoryService._invoke_gemini_generate_content(
+                            model_id=model_id,
+                            prompt=prompt,
+                            config=config,
                         )
+                        image = StoryService._extract_image_from_gemini_response(response)
+                        if image is not None:
+                            return image
 
-                    response = genai_client.models.generate_content(
-                        model=model_id,
-                        contents=[prompt],
-                        config=config,
-                    )
-                    image = StoryService._extract_image_from_gemini_response(response)
-                    if image is not None:
-                        return image
+                        diagnostic = StoryService._extract_text_from_gemini_response(response)
+                        if StoryService._is_policy_or_nsfw_error(diagnostic):
+                            raise RuntimeError(f"Gemini policy block: {diagnostic[:220]}")
+                        raise RuntimeError(f"Gemini returned no image for model {model_id}: {diagnostic[:220]}")
+                    except Exception as e:
+                        error_text = str(e).lower()
+                        if "api_key_invalid" in error_text or "api key not valid" in error_text:
+                            GEMINI_IMAGE_PROVIDER_ENABLED = False
+                            raise RuntimeError("Gemini API key invalid; disabling Gemini image provider") from e
 
-                    diagnostic = StoryService._extract_text_from_gemini_response(response)
-                    if StoryService._is_policy_or_nsfw_error(diagnostic):
-                        raise RuntimeError(f"Gemini policy block: {diagnostic[:220]}")
-                    raise RuntimeError(f"Gemini returned no image for model {model_id}: {diagnostic[:220]}")
-                except Exception as e:
-                    last_error = e
-                    is_retryable = (
-                        "429" in str(e)
-                        or "rate limit" in str(e).lower()
-                        or "resource_exhausted" in str(e).lower()
-                        or "internal" in str(e).lower()
-                    )
-                    if is_retryable and attempt < 1:
-                        delay = 1.25 * (2 ** attempt) + random.uniform(0, 0.5)
-                        time.sleep(delay)
-                        continue
-                    print(f"Gemini image model {model_id} failed on attempt {attempt + 1}: {e}")
-                    break
+                        last_error = e
+                        is_retryable = (
+                            "429" in str(e)
+                            or "rate limit" in str(e).lower()
+                            or "resource_exhausted" in str(e).lower()
+                            or "internal" in str(e).lower()
+                        )
+                        if is_retryable and attempt < 1:
+                            delay = 1.25 * (2 ** attempt) + random.uniform(0, 0.5)
+                            time.sleep(delay)
+                            continue
+                        print(
+                            f"Gemini image model {model_id} failed on config {config_idx} "
+                            f"attempt {attempt + 1}: {e}"
+                        )
+                        break
 
         raise RuntimeError(f"Gemini image generation failed. Last error: {last_error}")
+
+    @staticmethod
+    def _build_gemini_image_config_candidates(model_id: str) -> List[Any]:
+        """Build config fallbacks compatible with multiple google-genai SDK versions."""
+        candidates: List[Any] = []
+
+        # Preferred path for SDKs that expose both GenerateContentConfig and ImageConfig.
+        image_config_cls = getattr(types, "ImageConfig", None)
+        if image_config_cls is not None:
+            try:
+                image_kwargs: Dict[str, Any] = {"aspect_ratio": "3:4"}
+                if "2.5-flash-image" not in model_id:
+                    image_kwargs["image_size"] = "2K"
+                candidates.append(
+                    types.GenerateContentConfig(
+                        response_modalities=["IMAGE"],
+                        image_config=image_config_cls(**image_kwargs),
+                    )
+                )
+            except Exception:
+                pass
+
+        # Widely-supported typed config fallback.
+        try:
+            candidates.append(types.GenerateContentConfig(response_modalities=["IMAGE"]))
+        except Exception:
+            pass
+
+        # Dict-based fallback for SDK versions with different typed classes.
+        candidates.append({"response_modalities": ["IMAGE"]})
+
+        # Last fallback: rely on prompt-only generation with no explicit config.
+        candidates.append(None)
+        return candidates
+
+    @staticmethod
+    def _invoke_gemini_generate_content(model_id: str, prompt: str, config: Any):
+        request_kwargs: Dict[str, Any] = {
+            "model": model_id,
+            "contents": [prompt],
+        }
+        if config is not None:
+            request_kwargs["config"] = config
+        return genai_client.models.generate_content(**request_kwargs)
 
     @staticmethod
     def _extract_text_from_gemini_response(response) -> str:
@@ -508,15 +583,20 @@ Step 6 - Output hook.
         encoded = quote_plus(cleaned)
         seed = random.randint(1, 999999)
         return [
-            f"https://image.pollinations.ai/prompt/{encoded}?width={AIHORDE_IMAGE_WIDTH}&height={AIHORDE_IMAGE_HEIGHT}&seed={seed}&nologo=true&model=flux",
-            f"https://image.pollinations.ai/prompt/{encoded}?width={AIHORDE_IMAGE_WIDTH}&height={AIHORDE_IMAGE_HEIGHT}&seed={seed}&nologo=true&enhance=true",
-            f"https://image.pollinations.ai/prompt/{encoded}?width={AIHORDE_IMAGE_WIDTH}&height={AIHORDE_IMAGE_HEIGHT}&seed={seed}&nologo=true",
+            f"https://image.pollinations.ai/prompt/{encoded}?width={AIHORDE_IMAGE_WIDTH}&height={AIHORDE_IMAGE_HEIGHT}&seed={seed}&nologo=true&safe=true&model=flux",
+            f"https://image.pollinations.ai/prompt/{encoded}?width={AIHORDE_IMAGE_WIDTH}&height={AIHORDE_IMAGE_HEIGHT}&seed={seed}&nologo=true&safe=true&enhance=true",
+            f"https://image.pollinations.ai/prompt/{encoded}?width={AIHORDE_IMAGE_WIDTH}&height={AIHORDE_IMAGE_HEIGHT}&seed={seed}&nologo=true&safe=true",
         ]
 
     @staticmethod
     def _generate_with_aihorde(prompt: str):
         """Generate image through AI Horde async API and return PIL image or None."""
         from PIL import Image
+        global AIHORDE_MODEL_FILTER_ENABLED
+        global AIHORDE_PROVIDER_ENABLED
+
+        if not AIHORDE_PROVIDER_ENABLED:
+            raise RuntimeError("AI Horde provider disabled")
 
         headers = {
             "apikey": aihorde_api_key,
@@ -524,7 +604,7 @@ Step 6 - Output hook.
             "Content-Type": "application/json",
         }
 
-        payload = {
+        base_payload = {
             "prompt": f"{prompt} ###{AIHORDE_NEGATIVE_PROMPT}",
             "nsfw": False,
             "censor_nsfw": True,
@@ -538,25 +618,94 @@ Step 6 - Output hook.
                 "cfg_scale": AIHORDE_CFG_SCALE,
             },
         }
-        selected_models = StoryService._resolve_aihorde_models()
-        if selected_models:
-            payload["models"] = selected_models
+        if AIHORDE_POST_PROCESSORS:
+            base_payload["params"]["post_processing"] = AIHORDE_POST_PROCESSORS
 
-        enqueue = requests.post(
-            "https://aihorde.net/api/v2/generate/async",
-            headers=headers,
-            json=payload,
-            timeout=30,
-        )
-        if enqueue.status_code == 403 and selected_models:
-            print("WARNING: AI Horde rejected filtered model request (403). Retrying without model filter.")
-            payload.pop("models", None)
+        profiles = [
+            {
+                "name": "configured",
+                "width": AIHORDE_IMAGE_WIDTH,
+                "height": AIHORDE_IMAGE_HEIGHT,
+                "steps": AIHORDE_STEPS,
+                "use_post": bool(AIHORDE_POST_PROCESSORS),
+            },
+            {
+                "name": "safe-fallback",
+                "width": 768,
+                "height": 1152,
+                "steps": min(AIHORDE_STEPS, 24),
+                "use_post": False,
+            },
+            {
+                "name": "light-fallback",
+                "width": 512,
+                "height": 768,
+                "steps": min(AIHORDE_STEPS, 20),
+                "use_post": False,
+            },
+        ]
+
+        enqueue = None
+        request_payload = None
+        last_forbidden = False
+        for profile in profiles:
+            request_payload = json.loads(json.dumps(base_payload))
+            request_payload["params"]["width"] = profile["width"]
+            request_payload["params"]["height"] = profile["height"]
+            request_payload["params"]["steps"] = profile["steps"]
+            if not profile["use_post"]:
+                request_payload["params"].pop("post_processing", None)
+
+            selected_models = StoryService._resolve_aihorde_models() if AIHORDE_MODEL_FILTER_ENABLED else []
+            if selected_models:
+                request_payload["models"] = selected_models
+
             enqueue = requests.post(
                 "https://aihorde.net/api/v2/generate/async",
                 headers=headers,
-                json=payload,
+                json=request_payload,
                 timeout=30,
             )
+            if enqueue.status_code == 403 and selected_models:
+                print("WARNING: AI Horde rejected filtered model request (403). Retrying without model filter.")
+                AIHORDE_MODEL_FILTER_ENABLED = False
+                request_payload.pop("models", None)
+                enqueue = requests.post(
+                    "https://aihorde.net/api/v2/generate/async",
+                    headers=headers,
+                    json=request_payload,
+                    timeout=30,
+                )
+
+            if enqueue.status_code != 403:
+                break
+
+            last_forbidden = True
+            print(
+                f"WARNING: AI Horde rejected profile {profile['name']} ({profile['width']}x{profile['height']}, "
+                f"steps={profile['steps']}). Trying lower-cost fallback."
+            )
+
+        if enqueue is not None and enqueue.status_code == 403:
+            if aihorde_api_key and aihorde_api_key != "0000000000":
+                anon_headers = dict(headers)
+                anon_headers["apikey"] = "0000000000"
+                enqueue = requests.post(
+                    "https://aihorde.net/api/v2/generate/async",
+                    headers=anon_headers,
+                    json=request_payload,
+                    timeout=30,
+                )
+                if enqueue.status_code == 202:
+                    headers = anon_headers
+                    last_forbidden = False
+                else:
+                    last_forbidden = enqueue.status_code == 403
+
+        if enqueue is not None and enqueue.status_code == 403 and last_forbidden:
+            AIHORDE_PROVIDER_ENABLED = False
+            raise RuntimeError("AI Horde rejected all generation profiles with 403. Provider disabled for this process.")
+
         enqueue.raise_for_status()
         enqueue_data = enqueue.json()
         request_id = enqueue_data.get("id")
@@ -618,16 +767,46 @@ Step 6 - Output hook.
             catalog_res.raise_for_status()
             catalog = catalog_res.json() or []
 
-            available = {str(item.get("name", "")).strip().lower(): str(item.get("name", "")).strip() for item in catalog}
-            selected = []
+            image_catalog = [item for item in catalog if str(item.get("type", "")).lower() == "image"]
+            available = {
+                str(item.get("name", "")).strip().lower(): item
+                for item in image_catalog
+                if str(item.get("name", "")).strip()
+            }
+
+            blocked_keywords = (
+                "nsfw",
+                "hentai",
+                "porn",
+                "nude",
+                "erotic",
+                "fetish",
+                "sexy",
+                "waifu",
+                "anything",
+            )
+
+            selected_entries = []
             for preferred in configured:
                 key = preferred.strip().lower()
-                if key in available:
-                    selected.append(available[key])
+                entry = available.get(key)
+                if not entry:
+                    continue
+                candidate_name = str(entry.get("name", "")).strip().lower()
+                if any(blocked in candidate_name for blocked in blocked_keywords):
+                    continue
+                selected_entries.append(entry)
+
+            selected = [
+                str(entry.get("name", "")).strip()
+                for entry in sorted(selected_entries, key=StoryService._score_aihorde_model, reverse=True)
+                if str(entry.get("name", "")).strip()
+            ]
 
             if selected:
-                print(f"DEBUG: AI Horde selected models: {selected}")
-                return selected
+                final_models = selected[:4]
+                print(f"DEBUG: AI Horde selected models: {final_models}")
+                return final_models
 
             safe_quality_keywords = (
                 "dreamshaper",
@@ -638,17 +817,24 @@ Step 6 - Output hook.
                 "stable diffusion xl",
                 "deliberate",
             )
-            blocked_keywords = ("nsfw", "hentai", "porn")
             fallback_selected = []
-            for name in available.values():
+            for entry in image_catalog:
+                name = str(entry.get("name", "")).strip()
+                if not name:
+                    continue
                 lower_name = name.lower()
                 if any(blocked in lower_name for blocked in blocked_keywords):
                     continue
                 if any(keyword in lower_name for keyword in safe_quality_keywords):
-                    fallback_selected.append(name)
+                    fallback_selected.append(entry)
 
             if fallback_selected:
-                final_models = fallback_selected[:4]
+                ranked = sorted(fallback_selected, key=StoryService._score_aihorde_model, reverse=True)
+                final_models = [
+                    str(entry.get("name", "")).strip()
+                    for entry in ranked
+                    if str(entry.get("name", "")).strip()
+                ][:4]
                 print(f"WARNING: Configured models unavailable. Falling back to safe quality models: {final_models}")
                 return final_models
 
@@ -657,6 +843,15 @@ Step 6 - Output hook.
         except Exception as e:
             print(f"WARNING: Failed to fetch AI Horde model catalog: {e}. Using configured models as-is.")
             return AIHORDE_MODELS
+
+    @staticmethod
+    def _score_aihorde_model(entry: Dict[str, Any]) -> float:
+        """Score models by quality/reliability signals from AI Horde status API."""
+        performance = float(entry.get("performance") or 0.0)
+        workers = float(entry.get("count") or 0.0)
+        queued = float(entry.get("queued") or 0.0)
+        eta = float(entry.get("eta") or 0.0)
+        return (performance / 100000.0) + (workers * 2.0) - (queued / 10000000.0) - (eta * 0.2)
     
     @staticmethod
     def save_generated_image(image, filename: str = None) -> str:
@@ -667,6 +862,8 @@ Step 6 - Output hook.
             if not isinstance(image, Image.Image):
                 raise TypeError("Expected PIL.Image from provider output")
 
+            image = StoryService._postprocess_generated_image(image)
+
             final_name = filename or f"{uuid.uuid4()}.png"
             filepath = IMAGES_DIR / final_name
             image.save(filepath, format="PNG")
@@ -674,6 +871,49 @@ Step 6 - Output hook.
         except Exception as e:
             print(f"Error saving generated image: {str(e)}")
             return BASE_IMAGE_URL + "placeholder-download-error.png"
+
+    @staticmethod
+    def _postprocess_generated_image(image):
+        """Normalize dimensions and sharpen output for more consistent quality."""
+        from PIL import Image, ImageEnhance, ImageFilter
+
+        if image.mode not in ("RGB", "RGBA"):
+            image = image.convert("RGB")
+        elif image.mode == "RGBA":
+            image = image.convert("RGB")
+
+        image = StoryService._fit_image_to_target(image, TARGET_IMAGE_WIDTH, TARGET_IMAGE_HEIGHT)
+
+        # Light-touch enhancement keeps style while improving panel readability.
+        image = image.filter(ImageFilter.UnsharpMask(radius=1.4, percent=125, threshold=2))
+        image = ImageEnhance.Contrast(image).enhance(1.06)
+        image = ImageEnhance.Sharpness(image).enhance(1.08)
+        return image
+
+    @staticmethod
+    def _fit_image_to_target(image, target_width: int, target_height: int):
+        """Upscale/crop to a stable 3:4 panel size for frontend consistency."""
+        from PIL import Image
+
+        if target_width <= 0 or target_height <= 0:
+            return image
+
+        src_w, src_h = image.size
+        if src_w <= 0 or src_h <= 0:
+            return image
+
+        scale = max(target_width / src_w, target_height / src_h)
+        resized_w = max(1, int(round(src_w * scale)))
+        resized_h = max(1, int(round(src_h * scale)))
+
+        if resized_w != src_w or resized_h != src_h:
+            image = image.resize((resized_w, resized_h), Image.Resampling.LANCZOS)
+
+        left = max(0, (resized_w - target_width) // 2)
+        top = max(0, (resized_h - target_height) // 2)
+        right = left + target_width
+        bottom = top + target_height
+        return image.crop((left, top, right, bottom))
 
     @staticmethod
     def _prompt_cache_filename(prompt: str) -> str:
